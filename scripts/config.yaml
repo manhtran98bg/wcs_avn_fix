@@ -1,0 +1,28 @@
+wcs:
+  user: WCS
+  pass: rostek2019
+  url: http://172.21.99.23:3100
+
+ais:
+  broker: 172.21.99.23
+  port: 1883
+  user: rostek
+  password: rostek2019
+  timeout: 6
+
+pda:
+  host: 0.0.0.0
+  port: 8100
+
+gateway:
+  url: http://172.21.99.44:5500
+  host: 0.0.0.0
+  port: 8080
+  pwm:
+    ip: 172.21.99.120
+    port: 502
+
+rcs:
+  url: http://172.21.99.21:8181/rcms/services/rest/hikRpcService
+  host: 0.0.0.0
+  port: 8000

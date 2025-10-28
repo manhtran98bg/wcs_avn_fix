@@ -1,0 +1,25 @@
+from rostek_utils.utils.pattern import Define_Class
+
+class AUTO_OUTPUT_MISSION_STEP(Define_Class):
+    CREATED = 0
+    BIND_PICKUP = 1
+    SEND_RCS = 2
+    WAIT_AGV = 3
+    WAIT_REACH_AUTO = 4
+    OFF_AUTO_CURTAIN = 5
+    CONTINUE_AUTO = 6
+    WAIT_PICKUP = 7
+    ON_AUTO_CURTAIN = 8
+    WAIT_REACH_PWM = 9
+    WAIT_PWM = 10
+    OFF_PWM_CURTAIN = 11
+    CONTINUE_PWM = 12
+    WAIT_UNLOAD = 13
+    CONTINUE_BEHIND = 14
+    WAIT_BEHIND = 15
+    CONTINUE_MANUAL = 16
+    WAIT_MANUAL = 17
+    CONTINUE_FRONT = 18
+    WAIT_FRONT = 19
+
+WAIT_PWM_TIMEOUT = 3600

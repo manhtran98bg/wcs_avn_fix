@@ -1,0 +1,9 @@
+**venv
+**__pycache__
+**build
+**dist
+**node_modules
+**server.spec
+**log
+**.vscode
+**old_log*
