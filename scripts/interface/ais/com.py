@@ -9,6 +9,9 @@ from rostek_utils.com.mqtt import Mqtt_Client
 from rostek_utils.utils.thread import Worker
 from time import time, sleep
 
+from common import MODULE_NAME
+from rostek_utils.utils.logger import Logger
+
 class AIS_Interface:
     """
     Communicate with AIS
@@ -28,7 +31,7 @@ class AIS_Interface:
         self.__conn: Mqtt_Client = None
         self.__conn_timeout = kwargs["timeout"]
         self.__last_uptime = 0
-
+        self.__logger = Logger(MODULE_NAME.AIS)
         keys = ["broker", "port", "user", "password"]
         self.__connect(**Helper.extractDict(kwargs, keys, keys))
     
@@ -66,6 +69,13 @@ class AIS_Interface:
         Handle agv state message
         """
         self.__last_uptime = time()
+        try:
+            self.__logger.info(
+                f"AIS MQTT RECEIVE: name={name}, topic={topic}, "
+                f"pause={getattr(msg, 'pause', None)}, normal={getattr(msg, 'normal', None)}"
+            )
+        except Exception as e:
+            self.__logger.error(f"AIS MQTT LOG FAIL: {e}")
         states = AIS_States_Signal()
         states.pause = msg.pause
         states.normal = msg.normal

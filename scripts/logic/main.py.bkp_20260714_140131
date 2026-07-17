@@ -32,7 +32,6 @@ from rostek_utils.utils.thread import Worker
 from rostek_utils.utils.logger import Logger
 from typing import Dict
 from time import sleep, time
-from threading import Lock
 
 class Main_Logic:
     """
@@ -66,7 +65,6 @@ class Main_Logic:
         self.__pwm_bypass = False
         self.__spec_robot_list = ["1645", "1646", "1647"]
         self.__spec_robot_id = 0
-        self.__ais_trigger_lock = Lock()
 
         self.__clearMission()
         self.__clearPause()
@@ -119,57 +117,37 @@ class Main_Logic:
         """
         Handle AIS pause/resume robot command
         """
-        self.__logger.info(f"AIS TRIGGER RECEIVE: pause={state.pause}, normal={state.normal}")
-        with self.__ais_trigger_lock:
-            robot_datas = self.__rcs.queryAgvStatus()
-            
+        robot_datas = self.__rcs.queryAgvStatus()
+        pause_datas = self.__db.getPauseList()
+        logger = Logger(MODULE_NAME.AIS)
 
-            for robot_code in state.pause:
-                pause_data = self.__db.getPauseList(robot_code).get(robot_code)
-                if pause_data:
-                    self.__logger.info(f"PAUSE ALREADY PAUSED: {robot_code}, {pause_data.method}")
-                    continue
+        for robot_code in state.pause:
+            if robot_code in pause_datas:
+                continue
 
-                if robot_datas.get(robot_code):
-                    block_area = robot_datas[robot_code]
-                    self.__logger.info(f"PAUSE BY BLOCK: {robot_code}, {block_area}")
-                    self.__db.updatePause(robot_code, block_area)
-                    self.__rcs.setBlockArea(block_area, True)
-                    # sleep(0.1)
-                else:
-                    self.__logger.info(f"PAUSE BY PAUSE: {robot_code}")
-                    self.__db.updatePause(robot_code, PAUSE_DEFAULT_METHOD)
-                self.__rcs.pauseRobot(robot_code)
-            
-            for robot_code in state.normal:
-                pause_data = self.__db.getPauseList(robot_code).get(robot_code)
-                if not pause_data:
-                    self.__rcs.resumeRobot(robot_code)
-                    self.__logger.info(f"RESUME NOT PAUSE: {robot_code}")
-                    continue
+            if robot_datas.get(robot_code):
+                logger.info(f"PAUSE BY BLOCK: {robot_code}, {robot_datas[robot_code]}")
+                self.__db.updatePause(robot_code, robot_datas[robot_code])
+                self.__rcs.setBlockArea(robot_datas[robot_code], True)
+                sleep(1)
+            else:
+                logger.info(f"PAUSE BY PAUSE: {robot_code}")
+                self.__db.updatePause(robot_code, PAUSE_DEFAULT_METHOD)
+            self.__rcs.pauseRobot(robot_code)
+        
+        for robot_code in state.normal:
+            self.__rcs.resumeRobot(robot_code)
+            if robot_code not in pause_datas:
+                logger.info(f"RESUME NOT PAUSE: {robot_code}")
+                continue
 
-                pause_method = pause_data.method
-                if pause_method == PAUSE_DEFAULT_METHOD:
-                    self.__logger.info(f"RESUME ON PAUSE: {robot_code}")
-                    self.__rcs.resumeRobot(robot_code)
-                    self.__removePauseIfMatch(robot_code, pause_method)
-                else:
-                    self.__logger.info(f"RESUME ON BLOCK: {robot_code}, {pause_method}")
-                    self.__rcs.resumeRobot(robot_code)
-                    # sleep(0.1)
-                    self.__rcs.setBlockArea(pause_method, False)
-                    self.__removePauseIfMatch(robot_code, pause_method)
-    
-    def __removePauseIfMatch(self, robot_code: str, pause_method: str):
-        """
-        Remove pause data only if it was not replaced by a newer AIS event.
-        """
-        current_pause = self.__db.getPauseList(robot_code).get(robot_code)
-        if current_pause and current_pause.method == pause_method:
+            if pause_datas[robot_code].method == PAUSE_DEFAULT_METHOD:
+                logger.info(f"RESUME ON PAUSE: {robot_code}")
+            else:
+                logger.info(f"RESUME ON BLOCK: {robot_code}, {pause_datas[robot_code].method}")
+                sleep(1)
+                self.__rcs.setBlockArea(pause_datas[robot_code].method, False)
             self.__db.removePause(robot_code)
-        else:
-            current_method = current_pause.method if current_pause else None
-            self.__logger.info(f"SKIP REMOVE PAUSE, DATA CHANGED: {robot_code}, old={pause_method}, current={current_method}")
     
     def __onUpdateAgv(self, signal: RCS_Notify_Signal):
         """
@@ -207,9 +185,6 @@ class Main_Logic:
                 state.normal = ["1645", "1646", "1647"]
             else:
                 state.pause = ["1645", "1646", "1647"]
-            Logger(MODULE_NAME.LOGIC).info(
-                f"AIS CONNECTION CHANGE: connected={check_connection}"
-            )
             self.__onAISTrigger(state)
             ais_connected = check_connection
             sleep(0.5)
