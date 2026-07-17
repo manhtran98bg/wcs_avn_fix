@@ -200,6 +200,7 @@ class RCS_Interface:
             "robotCount": len(agv_codes),
             "robots": agv_codes
         }
+        self.__logger.info(f"Pause robot req: {req}")
         
         try:
             res = RestApi.client.post(
@@ -210,6 +211,7 @@ class RCS_Interface:
 
             if res.status_code in HTTP_RESPONSE_CODE.OK:
                 response = res.json()
+                self.__logger.info(f"Pause robot res: {response}")
                 if response["code"] == RCS_SUCCESS_CODE:
                     return True
                 
@@ -231,6 +233,7 @@ class RCS_Interface:
             "robotCount": len(agv_codes),
             "robots": agv_codes
         }
+        self.__logger.info(f"Resume robot req: {req}")
         
         try:
             res = RestApi.client.post(
@@ -241,6 +244,7 @@ class RCS_Interface:
 
             if res.status_code in HTTP_RESPONSE_CODE.OK:
                 response = res.json()
+                self.__logger.info(f"Resume robot res: {response}")
                 if response["code"] == RCS_SUCCESS_CODE:
                     return True
                 
