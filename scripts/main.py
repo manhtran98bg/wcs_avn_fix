@@ -11,6 +11,7 @@ for name in MODULE_NAME.values():
 
     Logger(name, to_screen=False, to_file=True, file_name=f"../log/{name.lower()}")
 Logger("THREAD", to_screen=False, to_file=True, file_name=f"../log/thread_error")
+Logger(MODULE_NAME.LOGIC, to_screen=True, to_file=True, file_name=f"../log/logic")
 Logger("MODBUS_CLIENT", to_screen=False, to_file=True, file_name=f"../log/modbus_client")
 
 from interface.ais.com import AIS_Interface

@@ -33,6 +33,10 @@ from rostek_utils.utils.logger import Logger
 from typing import Dict
 from time import sleep, time
 from threading import Lock
+from collections import deque
+
+AIS_COMMAND_RETRY_INTERVAL = 2
+AIS_COMMAND_IDLE_SLEEP = 0.5
 
 class Main_Logic:
     """
@@ -66,10 +70,14 @@ class Main_Logic:
         self.__pwm_bypass = False
         self.__spec_robot_list = ["1645", "1646", "1647"]
         self.__spec_robot_id = 0
-        self.__ais_trigger_lock = Lock()
+        self.__ais_command_lock = Lock()
+        self.__ais_command_queue = deque()
+        self.__ais_command_seq = 0
+        self.__ais_latest_commands = {}
 
         self.__clearMission()
         self.__clearPause()
+        self.__processAISCommandQueue()
         self.__handleSignal()
         self.checkAISConnection()
         self.__serviceLoop()
@@ -117,48 +125,163 @@ class Main_Logic:
     
     def __onAISTrigger(self, state: AIS_States_Signal):
         """
-        Handle AIS pause/resume robot command
+        Queue AIS pause/resume robot command
         """
         self.__logger.info(f"AIS TRIGGER RECEIVE: pause={state.pause}, normal={state.normal}")
-        with self.__ais_trigger_lock:
-            robot_datas = self.__rcs.queryAgvStatus()
-            
 
-            for robot_code in state.pause:
-                pause_data = self.__db.getPauseList(robot_code).get(robot_code)
-                if pause_data:
-                    self.__logger.info(f"PAUSE ALREADY PAUSED: {robot_code}, {pause_data.method}")
-                    continue
+        robot_datas = self.__rcs.queryAgvStatus() if state.pause else {}
 
-                if robot_datas.get(robot_code):
-                    block_area = robot_datas[robot_code]
-                    self.__logger.info(f"PAUSE BY BLOCK: {robot_code}, {block_area}")
-                    self.__db.updatePause(robot_code, block_area)
-                    self.__rcs.setBlockArea(block_area, True)
-                    # sleep(0.1)
+        for robot_code in state.pause:
+            pause_method = robot_datas.get(robot_code) or PAUSE_DEFAULT_METHOD
+            self.__enqueueAISCommand(robot_code, "pause", pause_method)
+
+        for robot_code in state.normal:
+            self.__enqueueAISCommand(robot_code, "resume")
+
+    def __enqueueAISCommand(self, robot_code: str, action: str, method: str = None):
+        """
+        Save the latest AIS desired action for a robot and queue it for sequential processing.
+        """
+        with self.__ais_command_lock:
+            previous = self.__ais_latest_commands.get(robot_code)
+            if action == "resume" and method is None and previous:
+                previous_method = previous.get("method")
+                if previous.get("action") == "pause" and previous_method != PAUSE_DEFAULT_METHOD:
+                    method = previous_method
+
+            self.__ais_command_seq += 1
+            command = {
+                "seq": self.__ais_command_seq,
+                "robot_code": robot_code,
+                "action": action,
+                "method": method,
+                "attempt": 0,
+                "next_retry_at": time()
+            }
+            self.__ais_latest_commands[robot_code] = command
+            self.__ais_command_queue.append(command)
+
+        self.__logger.info(f"AIS COMMAND ENQUEUE: {command}")
+
+    def __isLatestAISCommand(self, command: Dict):
+        with self.__ais_command_lock:
+            latest = self.__ais_latest_commands.get(command["robot_code"])
+            return latest and latest["seq"] == command["seq"]
+
+    def __clearLatestAISCommand(self, command: Dict):
+        with self.__ais_command_lock:
+            latest = self.__ais_latest_commands.get(command["robot_code"])
+            if latest and latest["seq"] == command["seq"]:
+                self.__ais_latest_commands.pop(command["robot_code"])
+
+    def __popAISCommand(self):
+        with self.__ais_command_lock:
+            if not self.__ais_command_queue:
+                return None
+            return self.__ais_command_queue.popleft()
+
+    def __requeueAISCommand(self, command: Dict):
+        with self.__ais_command_lock:
+            self.__ais_command_queue.append(command)
+
+    @Worker.employ
+    def __processAISCommandQueue(self):
+        """
+        Process AIS commands sequentially and retry failed RCS requests.
+        """
+        while True:
+            command = self.__popAISCommand()
+            if not command:
+                sleep(AIS_COMMAND_IDLE_SLEEP)
+                continue
+
+            retry_delay = command["next_retry_at"] - time()
+            if retry_delay > 0:
+                self.__requeueAISCommand(command)
+                sleep(min(retry_delay, AIS_COMMAND_IDLE_SLEEP))
+                continue
+
+            if not self.__isLatestAISCommand(command):
+                self.__logger.info(f"SKIP OLD AIS COMMAND: {command}")
+                continue
+
+            try:
+                if command["action"] == "pause":
+                    success = self.__handleAISPauseCommand(command)
+                elif command["action"] == "resume":
+                    success = self.__handleAISResumeCommand(command)
                 else:
-                    self.__logger.info(f"PAUSE BY PAUSE: {robot_code}")
-                    self.__db.updatePause(robot_code, PAUSE_DEFAULT_METHOD)
-                self.__rcs.pauseRobot(robot_code)
-            
-            for robot_code in state.normal:
-                pause_data = self.__db.getPauseList(robot_code).get(robot_code)
-                if not pause_data:
-                    self.__rcs.resumeRobot(robot_code)
-                    self.__logger.info(f"RESUME NOT PAUSE: {robot_code}")
-                    continue
+                    self.__logger.warn(f"WRONG AIS COMMAND ACTION: {command}")
+                    success = True
+            except Exception as e:
+                self.__logger.error(f"AIS COMMAND HANDLE ERROR: {command}, error={e}")
+                success = False
 
-                pause_method = pause_data.method
-                if pause_method == PAUSE_DEFAULT_METHOD:
-                    self.__logger.info(f"RESUME ON PAUSE: {robot_code}")
-                    self.__rcs.resumeRobot(robot_code)
-                    self.__removePauseIfMatch(robot_code, pause_method)
-                else:
-                    self.__logger.info(f"RESUME ON BLOCK: {robot_code}, {pause_method}")
-                    self.__rcs.resumeRobot(robot_code)
-                    # sleep(0.1)
-                    self.__rcs.setBlockArea(pause_method, False)
-                    self.__removePauseIfMatch(robot_code, pause_method)
+            if success:
+                self.__clearLatestAISCommand(command)
+                self.__logger.info(f"AIS COMMAND DONE: {command}")
+                continue
+
+            if not self.__isLatestAISCommand(command):
+                self.__logger.info(f"AIS COMMAND REPLACED, STOP RETRY: {command}")
+                continue
+
+            command["attempt"] += 1
+            command["next_retry_at"] = time() + AIS_COMMAND_RETRY_INTERVAL
+            self.__logger.warn(f"AIS COMMAND RETRY: {command}")
+            self.__requeueAISCommand(command)
+
+    def __handleAISPauseCommand(self, command: Dict):
+        robot_code = command["robot_code"]
+        pause_method = command["method"] or PAUSE_DEFAULT_METHOD
+
+        pause_data = self.__db.getPauseList(robot_code).get(robot_code)
+        if pause_data:
+            self.__logger.info(f"PAUSE ALREADY PAUSED: {robot_code}, {pause_data.method}")
+            return True
+
+        if pause_method != PAUSE_DEFAULT_METHOD:
+            self.__logger.info(f"PAUSE BY BLOCK: {robot_code}, {pause_method}")
+            block_result = self.__rcs.setBlockArea(pause_method, True)
+            self.__logger.info(f"PAUSE BLOCK RESULT: {robot_code}, {pause_method}, success={block_result}")
+        else:
+            self.__logger.info(f"PAUSE BY PAUSE: {robot_code}")
+
+        if not self.__rcs.pauseRobot(robot_code):
+            self.__logger.warn(
+                f"PAUSE FAILED, KEEP QUEUE RETRY: {robot_code}, method={pause_method}"
+            )
+            return False
+
+        self.__db.updatePause(robot_code, pause_method)
+        return True
+
+    def __handleAISResumeCommand(self, command: Dict):
+        robot_code = command["robot_code"]
+        pause_data = self.__db.getPauseList(robot_code).get(robot_code)
+        pause_method = pause_data.method if pause_data else command.get("method")
+
+        if pause_method == PAUSE_DEFAULT_METHOD:
+            self.__logger.info(f"RESUME ON PAUSE: {robot_code}")
+        elif pause_method:
+            self.__logger.info(f"RESUME ON BLOCK: {robot_code}, {pause_method}")
+        else:
+            self.__logger.info(f"RESUME NOT PAUSE: {robot_code}")
+
+        if not self.__rcs.resumeRobot(robot_code):
+            self.__logger.warn(
+                f"RESUME FAILED, KEEP QUEUE RETRY: {robot_code}, method={pause_method}"
+            )
+            return False
+
+        if pause_method and pause_method != PAUSE_DEFAULT_METHOD:
+            unblock_result = self.__rcs.setBlockArea(pause_method, False)
+            self.__logger.info(f"RESUME UNBLOCK RESULT: {robot_code}, {pause_method}, success={unblock_result}")
+
+        if pause_data:
+            self.__removePauseIfMatch(robot_code, pause_method)
+
+        return True
     
     def __removePauseIfMatch(self, robot_code: str, pause_method: str):
         """
