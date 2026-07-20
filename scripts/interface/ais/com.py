@@ -12,6 +12,9 @@ from time import time, sleep
 from common import MODULE_NAME
 from rostek_utils.utils.logger import Logger
 
+AIS_AGV_STATE_STALE_TIMEOUT = 5
+AIS_AGV_STATE_FUTURE_TOLERANCE = 2
+
 class AIS_Interface:
     """
     Communicate with AIS
@@ -68,17 +71,55 @@ class AIS_Interface:
         """
         Handle agv state message
         """
-        self.__last_uptime = time()
+        now = time()
+        timestamp = getattr(msg, "timestamp", None)
+        pause = getattr(msg, "pause", None)
+        normal = getattr(msg, "normal", None)
+
+        if timestamp is None:
+            self.__logger.warn(
+                f"AIS MQTT DROP INVALID: reason=missing_timestamp, "
+                f"name={name}, topic={topic}, pause={pause}, normal={normal}"
+            )
+            return
+
+        try:
+            timestamp = float(timestamp)
+        except Exception:
+            self.__logger.warn(
+                f"AIS MQTT DROP INVALID: reason=bad_timestamp, "
+                f"name={name}, topic={topic}, timestamp={timestamp}, "
+                f"pause={pause}, normal={normal}"
+            )
+            return
+
+        age = now - timestamp
+        if age > AIS_AGV_STATE_STALE_TIMEOUT:
+            self.__logger.warn(
+                f"AIS MQTT DROP STALE: age={age:.3f}, "
+                f"name={name}, topic={topic}, pause={pause}, normal={normal}"
+            )
+            return
+
+        if age < -AIS_AGV_STATE_FUTURE_TOLERANCE:
+            self.__logger.warn(
+                f"AIS MQTT DROP FUTURE: skew={-age:.3f}, "
+                f"name={name}, topic={topic}, timestamp={timestamp}, "
+                f"pause={pause}, normal={normal}"
+            )
+            return
+
+        self.__last_uptime = now
         try:
             self.__logger.info(
                 f"AIS MQTT RECEIVE: name={name}, topic={topic}, "
-                f"pause={getattr(msg, 'pause', None)}, normal={getattr(msg, 'normal', None)}"
+                f"age={age:.3f}, pause={pause}, normal={normal}"
             )
         except Exception as e:
             self.__logger.error(f"AIS MQTT LOG FAIL: {e}")
         states = AIS_States_Signal()
-        states.pause = msg.pause
-        states.normal = msg.normal
+        states.pause = pause or []
+        states.normal = normal or []
         Signal_Handle().emit(SIGNAL_CHANNEL.AIS_AGV_STATES, states)
     
     def __onHeartbeat(self, name: str, topic: str, msg: AIS_Msg_Heartbeat):
