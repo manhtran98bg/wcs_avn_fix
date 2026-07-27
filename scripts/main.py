@@ -13,6 +13,7 @@ for name in MODULE_NAME.values():
 Logger("THREAD", to_screen=False, to_file=True, file_name=f"../log/thread_error")
 Logger(MODULE_NAME.LOGIC, to_screen=True, to_file=True, file_name=f"../log/logic")
 Logger("MODBUS_CLIENT", to_screen=False, to_file=True, file_name=f"../log/modbus_client")
+Logger("MQTT", to_screen=False, to_file=True, file_name=f"../log/mqtt")
 
 from interface.ais.com import AIS_Interface
 from interface.wcs.com import WCS_Interface
