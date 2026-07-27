@@ -1,8 +1,7 @@
 from rostek_utils.utils.pattern import Declare_Class
-from rostek_utils.com.mqtt import Mqtt_Message
 from rostek_utils.com.rest_api import Body_Model
 
-class Gateway_Uptime_Payload(Mqtt_Message):
+class Gateway_Uptime_Payload(Declare_Class):
     gateway_id: str
     deviceId: str
     button1: int

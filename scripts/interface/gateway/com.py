@@ -1,6 +1,6 @@
 from .config import (
     GATEWAY_CONFIG, GATEWAY_AUTO_LINE, GATEWAY_CALLBOX,
-    GATEWAY_MQTT, GATEWAY_SUCCESS_MSG, GATEWAY_CALLBOX_BUTTON_MAPPING
+    GATEWAY_SUCCESS_MSG, GATEWAY_CALLBOX_BUTTON_MAPPING
 )
 from utils.helper import Helper
 from .model import Gateway_Callbox_Trigger, Gateway_Button_State, Gateway_Uptime_Payload
@@ -13,7 +13,6 @@ from database.com import Database_Interface
 from common import MODULE_NAME, CALLBOX_BUTTON
 
 from rostek_utils.com.rest_api import RestApi, HTTP_RESPONSE_CODE
-from rostek_utils.com.mqtt import Mqtt_Client
 from rostek_utils.utils.logger import Logger
 from rostek_utils.utils.thread import Worker
 import base64, time
@@ -52,7 +51,6 @@ class Gateway_Interface:
     """
     def __init__(self, **kwargs) -> None:
         self.__url = kwargs["url"]
-        self.__mqtt: Mqtt_Client = None
         self.__token: dict
         self.__logger = Logger(MODULE_NAME.GATEWAY)
         self.__getToken()
@@ -76,13 +74,6 @@ class Gateway_Interface:
         """
         Auto handle request from RCS in another thread
         """
-        # self.__mqtt = Mqtt_Client("DAL")
-        # self.__mqtt.subscribe(GATEWAY_MQTT.UPTIME_TOPIC, Gateway_Uptime_Payload, clbk=self.__onUptime)
-        # self.__mqtt.serve(
-        #     host=GATEWAY_MQTT.BROKER,
-        #     port=GATEWAY_MQTT.PORT,
-        #     user=GATEWAY_MQTT.USER,
-        #     password=GATEWAY_MQTT.PASSWORD)
         RestApi.serve(host, port)
     
     def __onUptime(self, name: str, topic: str, msg: Gateway_Uptime_Payload):
