@@ -56,6 +56,7 @@ class Gateway_Interface:
         self.__getToken()
 
         self.__connect(**Helper.extractDict(kwargs, ["host", "port"]))
+        print(f"Connect to {self.__url}")
         pwm_info = kwargs["pwm"]
         self.__pwm = PWM_Interface(ip=pwm_info["ip"], port=pwm_info["port"])
         self.__loop()
