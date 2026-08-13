@@ -4,11 +4,11 @@ wcs:
   url: http://172.21.99.23:3100
 
 ais:
-  broker: 172.21.99.230
+  broker: 172.21.99.23
   port: 1883
   user: rostek
   password: rostek2019
-  timeout: 6
+  timeout: 20
 
 pda:
   host: 0.0.0.0
