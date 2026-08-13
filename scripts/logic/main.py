@@ -582,11 +582,11 @@ class Main_Logic:
             (MISSION_TRIGGER_CREATOR.AUTO_LINE_2, info.product_line_2, "line2"),
             (MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET, info.empty_pallet, "pallet")
         ]
-        Logger(MODULE_NAME.GATEWAY).info(
-            f"Auto line status: line1={info.product_line_1}, "
-            f"line2={info.product_line_2}, pallet={info.empty_pallet}, "
-            f"latch={self.__auto_line_latch}"
-        )
+        # Logger(MODULE_NAME.GATEWAY).info(
+        #     f"Auto line status: line1={info.product_line_1}, "
+        #     f"line2={info.product_line_2}, pallet={info.empty_pallet}, "
+        #     f"latch={self.__auto_line_latch}"
+        # )
         for creator, status, _ in auto_lines:
             if status == AUTO_LINE_MODEL_STATUS.IDLE:
                 if self.__auto_line_latch[creator]:
