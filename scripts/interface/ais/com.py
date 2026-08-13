@@ -14,8 +14,8 @@ import paho.mqtt.client as mqtt
 from common import MODULE_NAME
 from rostek_utils.utils.logger import Logger
 
-AIS_AGV_STATE_STALE_TIMEOUT = 5
-AIS_AGV_STATE_FUTURE_TOLERANCE = 2
+AIS_AGV_STATE_STALE_TIMEOUT = 15
+AIS_AGV_STATE_FUTURE_TOLERANCE = 5
 
 
 class AIS_Interface:
@@ -175,13 +175,13 @@ class AIS_Interface:
             )
             return
 
-        if age < -AIS_AGV_STATE_FUTURE_TOLERANCE:
-            self.__logger.warn(
-                f"AIS MQTT DROP FUTURE: skew={-age:.3f}, "
-                f"name={name}, topic={topic}, timestamp={timestamp}, "
-                f"pause={pause}, normal={normal}"
-            )
-            return
+        # if age < -AIS_AGV_STATE_FUTURE_TOLERANCE:
+        #     self.__logger.warn(
+        #         f"AIS MQTT DROP FUTURE: skew={-age:.3f}, "
+        #         f"name={name}, topic={topic}, timestamp={timestamp}, "
+        #         f"pause={pause}, normal={normal}"
+        #     )
+        #     return
 
         self.__last_uptime = now
         try:
