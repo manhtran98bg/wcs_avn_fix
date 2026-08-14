@@ -66,11 +66,6 @@ class Main_Logic:
 
         self.__db = Database_Interface()
         self.__handlers: Dict[str, Mission_Handler] = {}
-        self.__auto_line_latch = {
-            MISSION_TRIGGER_CREATOR.AUTO_LINE_1: False,
-            MISSION_TRIGGER_CREATOR.AUTO_LINE_2: False,
-            MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET: False
-        }
 
         self.__pwm_bypass = False
         self.__spec_robot_list = ["1645", "1646", "1647"]
@@ -570,54 +565,19 @@ class Main_Logic:
 
     def checkAutoLineStatus(self):
         """
-        Create auto line mission once for each IDLE -> CALL edge.
+        Create mission if auto line calls.
         """
         info = self.__db.getAutoStatus()
         if not info:
             Logger(MODULE_NAME.GATEWAY).info("Auto line status: None")
             return
 
-        auto_lines = [
-            (MISSION_TRIGGER_CREATOR.AUTO_LINE_1, info.product_line_1, "line1"),
-            (MISSION_TRIGGER_CREATOR.AUTO_LINE_2, info.product_line_2, "line2"),
-            (MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET, info.empty_pallet, "pallet")
-        ]
-        # Logger(MODULE_NAME.GATEWAY).info(
-        #     f"Auto line status: line1={info.product_line_1}, "
-        #     f"line2={info.product_line_2}, pallet={info.empty_pallet}, "
-        #     f"latch={self.__auto_line_latch}"
-        # )
-        for creator, status, _ in auto_lines:
-            if status == AUTO_LINE_MODEL_STATUS.IDLE:
-                if self.__auto_line_latch[creator]:
-                    Logger(MODULE_NAME.GATEWAY).info(
-                        f"Auto line latch reset: creator={creator}"
-                    )
-                self.__auto_line_latch[creator] = False
-                continue
-
-            if status != AUTO_LINE_MODEL_STATUS.CALL:
-                continue
-
-            if self.__auto_line_latch[creator]:
-                Logger(MODULE_NAME.GATEWAY).info(
-                    f"Auto line call ignored by latch: creator={creator}"
-                )
-                continue
-
-            Logger(MODULE_NAME.GATEWAY).info(
-                f"Auto line call accepted: creator={creator}"
-            )
-            if self.__autoLineCreateMission(creator):
-                self.__auto_line_latch[creator] = True
-                Logger(MODULE_NAME.GATEWAY).info(
-                    f"Auto line latch set: creator={creator}"
-                )
-            else:
-                Logger(MODULE_NAME.GATEWAY).info(
-                    "Auto line mission create failed, "
-                    f"keep latch open for retry: creator={creator}"
-                )
+        if info.product_line_1 == AUTO_LINE_MODEL_STATUS.CALL:
+            self.__autoLineCreateMission(MISSION_TRIGGER_CREATOR.AUTO_LINE_1)
+        if info.product_line_2 == AUTO_LINE_MODEL_STATUS.CALL:
+            self.__autoLineCreateMission(MISSION_TRIGGER_CREATOR.AUTO_LINE_2)
+        if info.empty_pallet == AUTO_LINE_MODEL_STATUS.CALL:
+            self.__autoLineCreateMission(MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET)
     
     def __autoLineCreateMission(self, creator: MISSION_TRIGGER_CREATOR):
         """
@@ -643,7 +603,7 @@ class Main_Logic:
                     "Auto line mission ignored because handler exists: "
                     f"creator={creator}, type={creator_mapping[creator]['type']}"
                 )
-                return True
+                return False
 
         trigger = Mission_Trigger_Model()
         trigger.creator = creator
