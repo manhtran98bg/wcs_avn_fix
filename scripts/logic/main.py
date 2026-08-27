@@ -37,6 +37,7 @@ from collections import deque
 
 AIS_COMMAND_RETRY_INTERVAL = 2
 AIS_COMMAND_IDLE_SLEEP = 0.5
+AUTO_LINE_POST_FINISH_STALE_SEC = 8
 
 class Main_Logic:
     """
@@ -68,6 +69,23 @@ class Main_Logic:
         self.__handlers: Dict[str, Mission_Handler] = {}
 
         self.__pwm_bypass = False
+        self.__auto_line_post_finish_guard = {
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_1: {
+                "finished_at": 0,
+                "refreshed_after_finish": False,
+                "suppress_until": 0
+            },
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_2: {
+                "finished_at": 0,
+                "refreshed_after_finish": False,
+                "suppress_until": 0
+            },
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET: {
+                "finished_at": 0,
+                "refreshed_after_finish": False,
+                "suppress_until": 0
+            }
+        }
         self.__spec_robot_list = ["1645", "1646", "1647"]
         self.__spec_robot_id = 0
         self.__ais_command_lock = Lock()
@@ -464,7 +482,34 @@ class Main_Logic:
         """
         To give self-destruction to all mission handler
         """
-        self.__handlers.pop(mission_code)
+        handler = self.__handlers.pop(mission_code, None)
+        if handler:
+            self.__setAutoLinePostFinishGuard(handler.data.type, mission_code)
+
+    def __setAutoLinePostFinishGuard(self, mission_type: MISSION_MODEL_TYPE, mission_code: str):
+        """
+        Temporarily suppress stale auto line CALL after mission handler cleanup.
+        """
+        type_mapping = {
+            MISSION_MODEL_TYPE.AUTO_PRODUCT_1: MISSION_TRIGGER_CREATOR.AUTO_LINE_1,
+            MISSION_MODEL_TYPE.AUTO_PRODUCT_2: MISSION_TRIGGER_CREATOR.AUTO_LINE_2,
+            MISSION_MODEL_TYPE.AUTO_PALLET: MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET
+        }
+        if mission_type not in type_mapping:
+            return
+
+        creator = type_mapping[mission_type]
+        current_time = time()
+        self.__auto_line_post_finish_guard[creator] = {
+            "finished_at": current_time,
+            "refreshed_after_finish": False,
+            "suppress_until": current_time + AUTO_LINE_POST_FINISH_STALE_SEC
+        }
+        Logger(MODULE_NAME.GATEWAY).info(
+            "Auto line post-finish guard set: "
+            f"creator={creator}, mission_code={mission_code}, "
+            f"suppress_sec={AUTO_LINE_POST_FINISH_STALE_SEC}"
+        )
     
     def __cancelMission(self, trigger: Mission_Trigger_Model):
         """
@@ -572,12 +617,76 @@ class Main_Logic:
             Logger(MODULE_NAME.GATEWAY).info("Auto line status: None")
             return
 
-        if info.product_line_1 == AUTO_LINE_MODEL_STATUS.CALL:
-            self.__autoLineCreateMission(MISSION_TRIGGER_CREATOR.AUTO_LINE_1)
-        if info.product_line_2 == AUTO_LINE_MODEL_STATUS.CALL:
-            self.__autoLineCreateMission(MISSION_TRIGGER_CREATOR.AUTO_LINE_2)
-        if info.empty_pallet == AUTO_LINE_MODEL_STATUS.CALL:
-            self.__autoLineCreateMission(MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET)
+        for creator in [
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_1,
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_2,
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET
+        ]:
+            status = self.__getAutoLineCreatorStatus(creator)
+            if status == AUTO_LINE_MODEL_STATUS.IDLE:
+                self.__clearAutoLinePostFinishGuard(creator, "idle")
+                continue
+            if status != AUTO_LINE_MODEL_STATUS.CALL:
+                continue
+            if self.__shouldSuppressAutoLinePostFinishCall(creator):
+                continue
+            self.__autoLineCreateMission(creator)
+
+    def __getAutoLineCreatorStatus(self, creator: MISSION_TRIGGER_CREATOR):
+        info = self.__db.getAutoStatus()
+        if not info:
+            return None
+
+        status_mapping = {
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_1: info.product_line_1,
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_2: info.product_line_2,
+            MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET: info.empty_pallet
+        }
+        return status_mapping[creator]
+
+    def __clearAutoLinePostFinishGuard(self, creator: MISSION_TRIGGER_CREATOR, reason: str):
+        guard = self.__auto_line_post_finish_guard[creator]
+        if guard["suppress_until"] == 0:
+            return
+
+        self.__auto_line_post_finish_guard[creator] = {
+            "finished_at": 0,
+            "refreshed_after_finish": False,
+            "suppress_until": 0
+        }
+        Logger(MODULE_NAME.GATEWAY).info(
+            "Auto line post-finish guard cleared: "
+            f"creator={creator}, reason={reason}"
+        )
+
+    def __shouldSuppressAutoLinePostFinishCall(self, creator: MISSION_TRIGGER_CREATOR):
+        guard = self.__auto_line_post_finish_guard[creator]
+        if guard["suppress_until"] == 0:
+            return False
+
+        if not guard["refreshed_after_finish"]:
+            guard["refreshed_after_finish"] = True
+            try:
+                self.__gw.getAutoLineStatus()
+            except Exception as e:
+                Logger(MODULE_NAME.GATEWAY).error(
+                    "Auto line post-finish guard refresh failed: "
+                    f"creator={creator}, error={e}"
+                )
+            if self.__getAutoLineCreatorStatus(creator) == AUTO_LINE_MODEL_STATUS.IDLE:
+                self.__clearAutoLinePostFinishGuard(creator, "refresh_idle")
+                return True
+
+        current_time = time()
+        if current_time < guard["suppress_until"]:
+            Logger(MODULE_NAME.GATEWAY).info(
+                "Auto line call ignored by post-finish guard: "
+                f"creator={creator}, remaining_sec={guard['suppress_until'] - current_time:.1f}"
+            )
+            return True
+
+        self.__clearAutoLinePostFinishGuard(creator, "timeout")
+        return False
     
     def __autoLineCreateMission(self, creator: MISSION_TRIGGER_CREATOR):
         """
