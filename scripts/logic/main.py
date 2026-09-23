@@ -31,13 +31,15 @@ from common import MODULE_NAME
 from rostek_utils.utils.thread import Worker
 from rostek_utils.utils.logger import Logger
 from typing import Dict
-from time import sleep, time
+from time import monotonic, sleep, time
 from threading import Lock
 from collections import deque
 
 AIS_COMMAND_RETRY_INTERVAL = 2
 AIS_COMMAND_IDLE_SLEEP = 0.5
 AUTO_LINE_POST_FINISH_STALE_SEC = 8
+MISSION_CREATE_RETRY_DELAY_SEC = 5
+MISSION_CREATE_MAX_RETRY = 3
 
 class Main_Logic:
     """
@@ -67,6 +69,7 @@ class Main_Logic:
 
         self.__db = Database_Interface()
         self.__handlers: Dict[str, Mission_Handler] = {}
+        self.__mission_create_retry_queue = deque()
 
         self.__pwm_bypass = False
         self.__auto_line_post_finish_guard = {
@@ -378,7 +381,7 @@ class Main_Logic:
         """
         mission = self.__wcs.getMission(trigger)
         if not mission:
-            return False
+            return None
         
         mission = self.__mapMissionInfo(mission)
         mission.agv_code = agv_code
@@ -530,6 +533,63 @@ class Main_Logic:
         
         self.__logger.info(f"Cancel mission: {trigger.items()}\n-> {handler.data.items()}")
         handler.triggerCancel(trigger.creator == MISSION_TRIGGER_CREATOR.PDA)
+
+    def __missionCreateRetryKey(self, trigger: Mission_Trigger_Model):
+        """Return the stable identity shared by CALL and CANCEL triggers."""
+        return (
+            getattr(trigger, "creator", None),
+            getattr(trigger, "creator_name", None),
+            getattr(trigger, "location", None),
+            getattr(trigger, "sector", None),
+            getattr(trigger, "gateway_id", None),
+            getattr(trigger, "plc_id", None),
+            getattr(trigger, "button_id", None)
+        )
+
+    def __hasMissionCreateRetry(self, trigger: Mission_Trigger_Model):
+        key = self.__missionCreateRetryKey(trigger)
+        return any(
+            item["key"] == key
+            for item in self.__mission_create_retry_queue
+        )
+
+    def __scheduleMissionCreateRetry(self, trigger: Mission_Trigger_Model, retry_count: int):
+        key = self.__missionCreateRetryKey(trigger)
+        if self.__hasMissionCreateRetry(trigger):
+            return False
+
+        self.__mission_create_retry_queue.append({
+            "key": key,
+            "trigger": trigger,
+            "retry_count": retry_count,
+            "next_retry_at": monotonic() + MISSION_CREATE_RETRY_DELAY_SEC
+        })
+        self.__logger.warning(
+            "Mission creation scheduled for retry: "
+            f"retry={retry_count}/{MISSION_CREATE_MAX_RETRY}, "
+            f"delay_sec={MISSION_CREATE_RETRY_DELAY_SEC}, "
+            f"trigger={trigger.items()}"
+        )
+        return True
+
+    def __popDueMissionCreateRetry(self):
+        current_time = monotonic()
+        queue_length = len(self.__mission_create_retry_queue)
+        for _ in range(queue_length):
+            item = self.__mission_create_retry_queue.popleft()
+            if item["next_retry_at"] <= current_time:
+                return item
+            self.__mission_create_retry_queue.append(item)
+        return None
+
+    def __discardMissionCreateRetry(self, trigger: Mission_Trigger_Model):
+        key = self.__missionCreateRetryKey(trigger)
+        original_length = len(self.__mission_create_retry_queue)
+        self.__mission_create_retry_queue = deque(
+            item for item in self.__mission_create_retry_queue
+            if item["key"] != key
+        )
+        return original_length - len(self.__mission_create_retry_queue)
     
     def checkMissionTrigger(self):
         """
@@ -537,23 +597,66 @@ class Main_Logic:
         """
         try:
             trigger = self.__db.popTrigger()
+            retry_item = None
             if not trigger:
-                return False
+                retry_item = self.__popDueMissionCreateRetry()
+                if not retry_item:
+                    return False
+                trigger = retry_item["trigger"]
+
+            is_retry = retry_item is not None
+            retry_count = retry_item["retry_count"] if is_retry else 0
             
-            if trigger.creator == MISSION_TRIGGER_CREATOR.PDA:
+            if trigger.creator == MISSION_TRIGGER_CREATOR.PDA and not is_retry:
                 trigger = self.__wcs.fillPDATrigger(trigger)
-                Logger(MODULE_NAME.PDA).info(f"-> Filled: {trigger.items()}")
                 if not trigger:
                     return False
+                Logger(MODULE_NAME.PDA).info(f"-> Filled: {trigger.items()}")
+            elif is_retry:
+                self.__logger.info(
+                    "Retrying mission creation: "
+                    f"retry={retry_count}/{MISSION_CREATE_MAX_RETRY}, "
+                    f"trigger={trigger.items()}"
+                )
             else:
                 Logger(MODULE_NAME.GATEWAY).info(f"Callbox trigger: {trigger.items()}")
 
             if trigger.action == MISSION_TRIGGER_ACTION.CALL:
+                if not is_retry and self.__hasMissionCreateRetry(trigger):
+                    self.__logger.info(
+                        "Mission trigger ignored because retry is pending: "
+                        f"trigger={trigger.items()}"
+                    )
+                    return True
+
                 for mission_code in self.__handlers:
                     if self.__handlers[mission_code].checkTrigger(trigger):
+                        if is_retry:
+                            self.__logger.info(
+                                "Mission creation retry discarded because handler exists: "
+                                f"mission_code={mission_code}, trigger={trigger.items()}"
+                            )
+                            return True
                         return False
-                self.__createMission(trigger)
+
+                create_result = self.__createMission(trigger)
+                if create_result is None:
+                    if is_retry and retry_count >= MISSION_CREATE_MAX_RETRY:
+                        self.__logger.error(
+                            "Mission creation retry exhausted; trigger dropped: "
+                            f"retry={retry_count}/{MISSION_CREATE_MAX_RETRY}, "
+                            f"trigger={trigger.items()}"
+                        )
+                    else:
+                        next_retry_count = retry_count + 1 if is_retry else 1
+                        self.__scheduleMissionCreateRetry(trigger, next_retry_count)
             elif trigger.action == MISSION_TRIGGER_ACTION.CANCEL:
+                discarded_count = self.__discardMissionCreateRetry(trigger)
+                if discarded_count:
+                    self.__logger.info(
+                        "Mission creation retry discarded by cancel trigger: "
+                        f"count={discarded_count}, trigger={trigger.items()}"
+                    )
                 self.__cancelMission(trigger)
             else:
                 raise Exception(f"Wrong trigger action: {trigger.items()}")
