@@ -5,9 +5,12 @@ from .mission.manual_output.handler import Manual_Output_Mission_Handler
 from .mission.auto_output.handler import Auto_Output_Mission_Handler
 from .mission.pwm_output.handler import PWM_Output_Mission_Handler
 from .mission.model import Mission_Handler
-from common import Device_Information, GOODS_SECTOR, AUTO_LINE_BUTTON
+from common import Device_Information, GOODS_SECTOR, AUTO_LINE_BUTTON, CALLBOX_BUTTON
 from database.com import Database_Interface
 from database.model.mission import Mission_Model, MISSION_MODEL_TYPE
+from database.model.mission_pending import (
+    Mission_Pending_Model, MISSION_PENDING_STATE
+)
 from database.model.mission_trigger import (
     MISSION_TRIGGER_CREATOR, Mission_Trigger_Model,
     MISSION_TRIGGER_CREATOR_NAME, MISSION_TRIGGER_ACTION
@@ -21,6 +24,9 @@ from signal_emit.config import SIGNAL_CHANNEL
 from signal_emit.model import AIS_States_Signal, RCS_Notify_Signal
 from interface.wcs.com import WCS_Interface
 from interface.wcs.config import WCS_MISSION_STATUS, WCS_LOCATION
+from interface.wcs.model import (
+    WCS_MISSION_REQUEST_STATUS, WCS_MISSION_LOOKUP_STATUS
+)
 from interface.rcs.com import RCS_Interface
 from interface.rcs.config import RCS_LOCATION
 from interface.gateway.com import Gateway_Interface
@@ -38,6 +44,8 @@ from collections import deque
 AIS_COMMAND_RETRY_INTERVAL = 2
 AIS_COMMAND_IDLE_SLEEP = 0.5
 AUTO_LINE_POST_FINISH_STALE_SEC = 8
+MISSION_PENDING_VERIFY_DELAY_SEC = 5
+MISSION_PENDING_RETRY_DELAYS_SEC = [5, 10, 30, 60]
 
 class Main_Logic:
     """
@@ -102,9 +110,24 @@ class Main_Logic:
 
     def __clearMission(self):
         """
-        Remove all mission in Database and Backend
+        Remove local missions and cancel unrelated Backend missions.
+
+        Backend missions which may belong to a durable pending request are
+        preserved so the service can reconcile them after restart.
         """
         self.__db.removeMissions()
+
+        pendings = self.__db.getMissionPendings()
+        protected_codes = {
+            pending.mission_code
+            for pending in pendings.values()
+            if pending and pending.mission_code
+        }
+        protected_plcs = {
+            pending.plc_id
+            for pending in pendings.values()
+            if pending and not pending.mission_code
+        }
 
         wcs_missions = self.__wcs.getMissions(status=[
             WCS_MISSION_STATUS.SIGN,
@@ -112,6 +135,12 @@ class Main_Logic:
             WCS_MISSION_STATUS.PROCESS
         ])
         for mission in wcs_missions:
+            if mission.code in protected_codes or mission.call_boxes_id in protected_plcs:
+                self.__logger.warning(
+                    "Preserve Backend mission for pending reconciliation: "
+                    f"mission_code={mission.code}, plc_id={mission.call_boxes_id}"
+                )
+                continue
             self.__wcs.updateMissionStatus(
                 mission, WCS_MISSION_STATUS.CANCEL)
     
@@ -376,14 +405,25 @@ class Main_Logic:
         - Generate mission on Backend
         - Map type of mission, initialize default value of rcs_code
         """
-        mission = self.__wcs.getMission(trigger)
-        if not mission:
-            return False
-        
-        mission = self.__mapMissionInfo(mission)
-        mission.agv_code = agv_code
-        self.__logger.info(f"Create mission: {trigger.items()}\n-> {mission.items()}")
-        return self.__createMissionHandler(mission)
+        result = self.__wcs.getMission(trigger)
+        if result.status != WCS_MISSION_REQUEST_STATUS.CREATED:
+            return result
+
+        try:
+            mission = self.__mapMissionInfo(result.mission)
+            mission.agv_code = agv_code
+            self.__logger.info(f"Create mission: {trigger.items()}\n-> {mission.items()}")
+            result.handler_created = self.__createMissionHandler(mission)
+            if not result.handler_created:
+                result.status = WCS_MISSION_REQUEST_STATUS.FAILED
+                result.error = "Mission handler creation failed"
+        except Exception as e:
+            result.status = WCS_MISSION_REQUEST_STATUS.FAILED
+            result.error = str(e)
+            self.__logger.error(
+                f"Create mission handler error: trigger={trigger.items()}, error={e}"
+            )
+        return result
     
     def __mapMissionInfo(self, mission: Mission_Model):
         """
@@ -486,6 +526,298 @@ class Main_Logic:
         if handler:
             self.__setAutoLinePostFinishGuard(handler.data.type, mission_code)
 
+    @staticmethod
+    def __missionPendingKey(trigger: Mission_Trigger_Model):
+        return f"{trigger.gateway_id}:{trigger.plc_id}:{trigger.button_id}"
+
+    @staticmethod
+    def __triggerFromPending(pending: Mission_Pending_Model):
+        trigger = Mission_Trigger_Model()
+        trigger.creator = pending.creator
+        trigger.creator_name = pending.creator_name
+        trigger.location = pending.location
+        trigger.sector = pending.sector
+        trigger.gateway_id = pending.gateway_id
+        trigger.plc_id = pending.plc_id
+        trigger.button_id = pending.button_id
+        trigger.action = MISSION_TRIGGER_ACTION.CALL
+        return trigger
+
+    def __newMissionPending(self, trigger: Mission_Trigger_Model):
+        current_time = time()
+        pending = Mission_Pending_Model()
+        pending.key = self.__missionPendingKey(trigger)
+        pending.creator = trigger.creator
+        pending.creator_name = getattr(trigger, "creator_name", "")
+        pending.location = getattr(trigger, "location", "")
+        pending.sector = getattr(trigger, "sector", "")
+        pending.gateway_id = trigger.gateway_id
+        pending.plc_id = trigger.plc_id
+        pending.button_id = trigger.button_id
+        pending.state = MISSION_PENDING_STATE.CALL_PENDING
+        pending.mission_code = ""
+        pending.retry_count = 0
+        pending.next_retry_at = current_time
+        pending.verify_count = 0
+        pending.first_snapshot = {}
+        pending.last_error = ""
+        pending.created_at = current_time
+        pending.updated_at = current_time
+        self.__db.updateMissionPending(pending)
+        stored = self.__db.getMissionPendings(pending.key).get(pending.key)
+        if not stored:
+            self.__logger.error(
+                "Mission CALL not sent because pending record could not be persisted: "
+                f"key={pending.key}"
+            )
+        return stored
+
+    def __getMissionPending(self, trigger: Mission_Trigger_Model):
+        key = self.__missionPendingKey(trigger)
+        return self.__db.getMissionPendings(key).get(key)
+
+    def __scheduleMissionPending(self, pending: Mission_Pending_Model, error: str = ""):
+        delay_index = min(
+            pending.retry_count,
+            len(MISSION_PENDING_RETRY_DELAYS_SEC) - 1
+        )
+        delay = MISSION_PENDING_RETRY_DELAYS_SEC[delay_index]
+        pending.retry_count += 1
+        pending.next_retry_at = time() + delay
+        pending.last_error = error
+        pending.updated_at = time()
+        self.__db.updateMissionPending(pending)
+        self.__logger.warning(
+            "Mission pending scheduled: "
+            f"key={pending.key}, state={pending.state}, retry={pending.retry_count}, "
+            f"delay_sec={delay}, error={error}"
+        )
+
+    @staticmethod
+    def __hasValue(value):
+        return value is not None and str(value).strip().lower() not in ["", "0", "none"]
+
+    @staticmethod
+    def __isTerminalBackendMission(mission: Mission_Model):
+        return mission.current_state in [
+            WCS_MISSION_STATUS.CANCEL,
+            WCS_MISSION_STATUS.DONE
+        ]
+
+    @staticmethod
+    def __missionSnapshot(mission: Mission_Model):
+        return {
+            "code": mission.code,
+            "current_state": mission.current_state,
+            "rcs_code": str(mission.rcs_code or ""),
+            "agv_code": str(mission.agv_code or ""),
+            "sector": mission.sector,
+            "pickup_location": mission.pickup_location,
+            "return_location": mission.return_location,
+            "call_boxes_id": mission.call_boxes_id
+        }
+
+    @staticmethod
+    def __expectedMissionType(button_id: int):
+        manual_buttons = (
+            CALLBOX_BUTTON.EMPTY
+            + CALLBOX_BUTTON.CARTON
+            + CALLBOX_BUTTON.SEMI
+        )
+        if button_id in manual_buttons:
+            return button_id - 1
+        return {
+            AUTO_LINE_BUTTON.PRODUCT_1: MISSION_MODEL_TYPE.AUTO_PRODUCT_1,
+            AUTO_LINE_BUTTON.EMPTY: MISSION_MODEL_TYPE.AUTO_PALLET,
+            AUTO_LINE_BUTTON.PRODUCT_2: MISSION_MODEL_TYPE.AUTO_PRODUCT_2
+        }.get(button_id)
+
+    def __validateRecoveredMission(self, mission: Mission_Model,
+            pending: Mission_Pending_Model):
+        if mission.code != pending.mission_code:
+            return False, "mission code mismatch"
+        if mission.current_state != WCS_MISSION_STATUS.SIGN:
+            return False, f"mission state is {mission.current_state}"
+        if self.__hasValue(mission.rcs_code):
+            return False, f"mission already has RCS code {mission.rcs_code}"
+        if self.__hasValue(mission.agv_code):
+            return False, f"mission already has robot {mission.agv_code}"
+        if mission.call_boxes_id and mission.call_boxes_id != pending.plc_id:
+            return False, "mission PLC does not match pending trigger"
+
+        try:
+            mission = self.__mapMissionInfo(mission)
+        except Exception as e:
+            return False, f"mission mapping failed: {e}"
+
+        expected_type = self.__expectedMissionType(pending.button_id)
+        if expected_type is None or mission.type != expected_type:
+            return False, (
+                f"mission type {mission.type} does not match button "
+                f"{pending.button_id} expected type {expected_type}"
+            )
+        return True, ""
+
+    def __hasMatchingHandler(self, trigger: Mission_Trigger_Model,
+            mission_code: str = ""):
+        for code, handler in self.__handlers.items():
+            if code == mission_code or handler.checkTrigger(trigger):
+                return code
+        return None
+
+    def __handleMissionRequestResult(self, pending: Mission_Pending_Model, result):
+        if result.status == WCS_MISSION_REQUEST_STATUS.CREATED:
+            if result.handler_created:
+                self.__db.removeMissionPendings(pending.key)
+                self.__logger.info(
+                    f"Mission pending completed: key={pending.key}, status=created"
+                )
+            else:
+                self.__scheduleMissionPending(pending, result.error)
+            return
+
+        if result.status == WCS_MISSION_REQUEST_STATUS.EXISTS:
+            pending.state = MISSION_PENDING_STATE.VERIFYING
+            pending.mission_code = result.mission_code
+            pending.verify_count = 0
+            pending.first_snapshot = {}
+            pending.retry_count = 0
+            pending.next_retry_at = time()
+            pending.last_error = ""
+            pending.updated_at = time()
+            self.__db.updateMissionPending(pending)
+            self.__logger.warning(
+                "Existing Backend mission will be reconciled: "
+                f"key={pending.key}, mission_code={pending.mission_code}"
+            )
+            return
+
+        self.__scheduleMissionPending(pending, result.error)
+
+    def __processVerifyingMission(self, pending: Mission_Pending_Model):
+        lookup = self.__wcs.getMissionByCode(
+            pending.mission_code, pending.plc_id
+        )
+        if lookup.status != WCS_MISSION_LOOKUP_STATUS.FOUND:
+            error = lookup.error or lookup.status
+            self.__scheduleMissionPending(pending, error)
+            return
+
+        mission = lookup.mission
+        if self.__isTerminalBackendMission(mission):
+            self.__db.removeMissionPendings(pending.key)
+            self.__logger.warning(
+                "Mission pending removed because Backend mission is terminal: "
+                f"key={pending.key}, mission_code={pending.mission_code}, "
+                f"state={mission.current_state}"
+            )
+            return
+
+        valid, error = self.__validateRecoveredMission(mission, pending)
+        if not valid:
+            pending.state = MISSION_PENDING_STATE.ORPHAN_PROCESSING
+            pending.next_retry_at = 0
+            pending.last_error = error
+            pending.updated_at = time()
+            self.__db.updateMissionPending(pending)
+            self.__logger.error(
+                "Mission recovery stopped to prevent duplicate RCS task: "
+                f"key={pending.key}, mission_code={pending.mission_code}, error={error}"
+            )
+            return
+
+        snapshot = self.__missionSnapshot(mission)
+        if pending.verify_count == 0 or pending.first_snapshot != snapshot:
+            pending.first_snapshot = snapshot
+            pending.verify_count = 1
+            pending.next_retry_at = time() + MISSION_PENDING_VERIFY_DELAY_SEC
+            pending.updated_at = time()
+            self.__db.updateMissionPending(pending)
+            self.__logger.info(
+                "Mission recovery first verification passed: "
+                f"key={pending.key}, mission_code={pending.mission_code}"
+            )
+            return
+
+        trigger = self.__triggerFromPending(pending)
+        matching_handler = self.__hasMatchingHandler(trigger, mission.code)
+        if matching_handler:
+            self.__db.removeMissionPendings(pending.key)
+            self.__logger.info(
+                "Mission pending removed because handler already exists: "
+                f"key={pending.key}, mission_code={matching_handler}"
+            )
+            return
+
+        mission.gateway_id = pending.gateway_id
+        mission.plc_id = pending.plc_id
+        mission.button_id = pending.button_id
+        if self.__createMissionHandler(mission):
+            self.__db.removeMissionPendings(pending.key)
+            self.__logger.info(
+                "Mission handler recovered: "
+                f"key={pending.key}, mission_code={mission.code}"
+            )
+        else:
+            self.__scheduleMissionPending(pending, "Mission handler recovery failed")
+
+    def __processCancelPending(self, pending: Mission_Pending_Model):
+        trigger = self.__triggerFromPending(pending)
+        trigger.action = MISSION_TRIGGER_ACTION.CANCEL
+        if self.__wcs.cancelMission(trigger):
+            self.__db.removeMissionPendings(pending.key)
+            self.__logger.info(
+                f"Pending Backend mission cancelled: key={pending.key}"
+            )
+            return
+
+        error = "Backend cancel failed"
+        if pending.mission_code:
+            lookup = self.__wcs.getMissionByCode(
+                pending.mission_code, pending.plc_id
+            )
+            if lookup.status == WCS_MISSION_LOOKUP_STATUS.FOUND \
+                    and self.__isTerminalBackendMission(lookup.mission):
+                self.__db.removeMissionPendings(pending.key)
+                self.__logger.info(
+                    "Pending mission cancellation confirmed from Backend history: "
+                    f"key={pending.key}, mission_code={pending.mission_code}, "
+                    f"state={lookup.mission.current_state}"
+                )
+                return
+            if lookup.status == WCS_MISSION_LOOKUP_STATUS.FAILED:
+                error = f"{error}; lookup failed: {lookup.error}"
+
+        self.__scheduleMissionPending(pending, error)
+
+    def __processDueMissionPending(self):
+        current_time = time()
+        pendings = [
+            pending
+            for pending in self.__db.getMissionPendings().values()
+            if pending
+            and pending.state != MISSION_PENDING_STATE.ORPHAN_PROCESSING
+            and pending.next_retry_at <= current_time
+        ]
+        if not pendings:
+            return False
+
+        pendings.sort(key=lambda item: (
+            item.state != MISSION_PENDING_STATE.CANCEL_PENDING,
+            item.next_retry_at,
+            item.created_at
+        ))
+        pending = pendings[0]
+        if pending.state == MISSION_PENDING_STATE.CANCEL_PENDING:
+            self.__processCancelPending(pending)
+        elif pending.state == MISSION_PENDING_STATE.VERIFYING:
+            self.__processVerifyingMission(pending)
+        else:
+            trigger = self.__triggerFromPending(pending)
+            result = self.__createMission(trigger)
+            self.__handleMissionRequestResult(pending, result)
+        return True
+
     def __setAutoLinePostFinishGuard(self, mission_type: MISSION_MODEL_TYPE, mission_code: str):
         """
         Temporarily suppress stale auto line CALL after mission handler cleanup.
@@ -526,6 +858,23 @@ class Main_Logic:
                 handler = self.__handlers[code]
                 break
         if handler is None:
+            pending = self.__getMissionPending(trigger)
+            if not pending:
+                self.__logger.info(
+                    "Cancel ignored because neither handler nor pending mission exists: "
+                    f"trigger={trigger.items()}"
+                )
+                return
+
+            pending.state = MISSION_PENDING_STATE.CANCEL_PENDING
+            pending.next_retry_at = time()
+            pending.updated_at = time()
+            self.__db.updateMissionPending(pending)
+            self.__logger.warning(
+                "Cancel pending Backend mission without local handler: "
+                f"key={pending.key}, mission_code={pending.mission_code}"
+            )
+            self.__processCancelPending(pending)
             return
         
         self.__logger.info(f"Cancel mission: {trigger.items()}\n-> {handler.data.items()}")
@@ -538,21 +887,40 @@ class Main_Logic:
         try:
             trigger = self.__db.popTrigger()
             if not trigger:
+                self.__processDueMissionPending()
                 return False
             
             if trigger.creator == MISSION_TRIGGER_CREATOR.PDA:
                 trigger = self.__wcs.fillPDATrigger(trigger)
-                Logger(MODULE_NAME.PDA).info(f"-> Filled: {trigger.items()}")
                 if not trigger:
                     return False
+                Logger(MODULE_NAME.PDA).info(f"-> Filled: {trigger.items()}")
             else:
                 Logger(MODULE_NAME.GATEWAY).info(f"Callbox trigger: {trigger.items()}")
 
             if trigger.action == MISSION_TRIGGER_ACTION.CALL:
-                for mission_code in self.__handlers:
-                    if self.__handlers[mission_code].checkTrigger(trigger):
-                        return False
-                self.__createMission(trigger)
+                matching_handler = self.__hasMatchingHandler(trigger)
+                if matching_handler:
+                    self.__logger.info(
+                        "Mission CALL ignored because handler exists: "
+                        f"mission_code={matching_handler}, trigger={trigger.items()}"
+                    )
+                    return True
+
+                pending = self.__getMissionPending(trigger)
+                if pending:
+                    self.__logger.info(
+                        "Mission CALL ignored because pending request exists: "
+                        f"key={pending.key}, state={pending.state}, "
+                        f"mission_code={pending.mission_code}"
+                    )
+                    return True
+
+                pending = self.__newMissionPending(trigger)
+                if not pending:
+                    return True
+                result = self.__createMission(trigger)
+                self.__handleMissionRequestResult(pending, result)
             elif trigger.action == MISSION_TRIGGER_ACTION.CANCEL:
                 self.__cancelMission(trigger)
             else:

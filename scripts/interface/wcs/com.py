@@ -1,5 +1,10 @@
 from .config import WCS_URL_PATH, WCS_SUCCESS_MSG, WCS_MISSION_STATUS, BIND_RCS_STATUS
-from .model import Mission_Info_Res, Device_Update_Req, Device_Information_Res, Mission_Trigger_Res, Bind_RCS_Model
+from .model import (
+    Mission_Info_Res, Device_Update_Req, Device_Information_Res,
+    Mission_Trigger_Res, Bind_RCS_Model, Mission_Request_Result,
+    Mission_Lookup_Result, WCS_MISSION_REQUEST_STATUS,
+    WCS_MISSION_LOOKUP_STATUS
+)
 from database.model.mission import Mission_Model
 from database.model.mission_trigger import MISSION_TRIGGER_ACTION, Mission_Trigger_Model, MISSION_TRIGGER_CREATOR
 from common import MODULE_NAME, Device_Information, LOCATION_STATUS, INTERFACE_CONVERTER, CALLBOX_BUTTON, AUTO_LINE_BUTTON
@@ -222,6 +227,8 @@ class WCS_Interface:
                         mission.return_location = raw_mission.return_location
                         mission.agv_code = raw_mission.robot_code
                         mission.rcs_code = raw_mission.mission_rcs
+                        mission.call_boxes_id = raw_mission.call_boxes_id
+                        mission.current_state = raw_mission.current_state
                         missions.append(mission)
                 return missions
             
@@ -230,6 +237,83 @@ class WCS_Interface:
             self.__logger.error(f"Get mission error: {e}")
 
         return []
+
+    def getMissionByCode(self, mission_code: str, device_id: str) -> Mission_Lookup_Result:
+        """Find one Backend history mission without requiring a new API."""
+        req = {
+            "filter": {
+                "call_boxes_id": device_id,
+                "current_state": [
+                    WCS_MISSION_STATUS.SIGN,
+                    WCS_MISSION_STATUS.PENDING,
+                    WCS_MISSION_STATUS.PROCESS,
+                    WCS_MISSION_STATUS.CANCEL,
+                    WCS_MISSION_STATUS.DONE
+                ]
+            }
+        }
+
+        try:
+            res = RestApi.client.post(
+                self.__url + WCS_URL_PATH.GET_MISSIONS,
+                headers=self.__token,
+                json=req,
+                timeout=6,
+            )
+
+            if res.status_code not in HTTP_RESPONSE_CODE.OK:
+                self.__logger.warn(f"Get mission by code fail: {res.content}")
+                return Mission_Lookup_Result(
+                    WCS_MISSION_LOOKUP_STATUS.FAILED,
+                    error=f"HTTP {res.status_code}"
+                )
+
+            response = res.json()
+            if response.get("msg") != WCS_SUCCESS_MSG.GET_LIST:
+                self.__logger.warn(f"Get mission by code fail: {res.content}")
+                return Mission_Lookup_Result(
+                    WCS_MISSION_LOOKUP_STATUS.FAILED,
+                    error=str(response.get("msg", "invalid response"))
+                )
+
+            matches = []
+            for data in response.get("metaData", []):
+                raw_mission = Mission_Info_Res.fromDict(data)
+                if raw_mission.mission_code != mission_code:
+                    continue
+
+                mission = Mission_Model()
+                mission.code = raw_mission.mission_code
+                mission.sector = raw_mission.sector
+                mission.location_id = raw_mission._id
+                mission.pickup_location = raw_mission.pickup_location
+                mission.return_location = raw_mission.return_location
+                mission.agv_code = raw_mission.robot_code
+                mission.rcs_code = raw_mission.mission_rcs
+                mission.call_boxes_id = raw_mission.call_boxes_id
+                mission.current_state = raw_mission.current_state
+                matches.append(mission)
+
+            if len(matches) == 1:
+                return Mission_Lookup_Result(
+                    WCS_MISSION_LOOKUP_STATUS.FOUND,
+                    mission=matches[0]
+                )
+            if len(matches) > 1:
+                error = f"Duplicate mission code in Backend: {mission_code}"
+                self.__logger.error(error)
+                return Mission_Lookup_Result(
+                    WCS_MISSION_LOOKUP_STATUS.FAILED,
+                    error=error
+                )
+
+            return Mission_Lookup_Result(WCS_MISSION_LOOKUP_STATUS.NOT_FOUND)
+        except Exception as e:
+            self.__logger.error(f"Get mission by code error: {e}")
+            return Mission_Lookup_Result(
+                WCS_MISSION_LOOKUP_STATUS.FAILED,
+                error=str(e)
+            )
 
     def updateMissionAgv(self, mission: Mission_Model):
         """
@@ -304,52 +388,52 @@ class WCS_Interface:
 
         return False
 
-    def getMission(self, trigger: Mission_Trigger_Model):
+    def getMission(self, trigger: Mission_Trigger_Model) -> Mission_Request_Result:
         """
         Send trigger to Backend to get mission information
         """
-        mission = None
+        result = Mission_Request_Result(WCS_MISSION_REQUEST_STATUS.FAILED)
         if trigger.creator == MISSION_TRIGGER_CREATOR.CALLBOX:
             if trigger.button_id not in CALLBOX_BUTTON.SEMI:
-                mission = self.__getStoreMission(trigger)
+                result = self.__getStoreMission(trigger)
             else:
-                mission = self.__getWrapMission(trigger)
+                result = self.__getWrapMission(trigger)
 
         elif trigger.creator == MISSION_TRIGGER_CREATOR.PDA:
             if trigger.button_id in CALLBOX_BUTTON.EMPTY:
-                mission = self.__getStoreMission(trigger)
+                result = self.__getStoreMission(trigger)
             elif trigger.button_id in CALLBOX_BUTTON.CARTON:
-                mission = self.__getStoreMission(trigger)
+                result = self.__getStoreMission(trigger)
             elif trigger.button_id in CALLBOX_BUTTON.SEMI:
-                mission = self.__getWrapMission(trigger)
+                result = self.__getWrapMission(trigger)
             elif trigger.button_id == AUTO_LINE_BUTTON.EMPTY:
-                mission = self.__getStoreMission(trigger)
+                result = self.__getStoreMission(trigger)
             elif trigger.button_id in [
                 AUTO_LINE_BUTTON.PRODUCT_1,
                 AUTO_LINE_BUTTON.PRODUCT_2
             ]:
-                mission = self.__getWrapMission(trigger)
+                result = self.__getWrapMission(trigger)
             else:
                 raise Exception(f"Wrong button id: {trigger.items()}")
 
         elif trigger.creator == MISSION_TRIGGER_CREATOR.AUTO_LINE_PALLET:
-            mission = self.__getStoreMission(trigger)
+            result = self.__getStoreMission(trigger)
 
         elif trigger.creator in [
             MISSION_TRIGGER_CREATOR.AUTO_LINE_1,
             MISSION_TRIGGER_CREATOR.AUTO_LINE_2
         ]:
-            mission = self.__getWrapMission(trigger)
+            result = self.__getWrapMission(trigger)
         
         elif trigger.creator == MISSION_TRIGGER_CREATOR.PWM:
-            mission = self.__getStoreMission(trigger)
+            result = self.__getStoreMission(trigger)
 
         else:
             raise Exception(f"Wrong trigger creator: {trigger.items()}")
         
-        return mission
+        return result
     
-    def __getWrapMission(self, trigger: Mission_Trigger_Model)-> Mission_Model:
+    def __getWrapMission(self, trigger: Mission_Trigger_Model) -> Mission_Request_Result:
         """
         Send line to pallet wrapper trigger
 
@@ -385,26 +469,30 @@ class WCS_Interface:
             if res.status_code in HTTP_RESPONSE_CODE.OK:
                 response = res.json()
                 raw_mission = Mission_Trigger_Res.fromDict(response)
+                if raw_mission.code == 2 and raw_mission.mission_code:
+                    self.__logger.warn(f"Wrap mission exists: {res.content}")
+                    return Mission_Request_Result(
+                        WCS_MISSION_REQUEST_STATUS.EXISTS,
+                        mission_code=raw_mission.mission_code,
+                        current_state=raw_mission.current_state
+                    )
                 if raw_mission.code != 2:
-                    mission = Mission_Model()
-                    mission.code = raw_mission.mission_code
-                    mission.location_id = raw_mission.location_id
-                    mission.sector = raw_mission.sectors
-                    mission.rcs_code = raw_mission.mission_rcs
-                    mission.pickup_location = raw_mission.pickup_location
-                    mission.return_location = raw_mission.return_location
-                    mission.gateway_id = trigger.gateway_id
-                    mission.plc_id = trigger.plc_id
-                    mission.button_id = trigger.button_id
-                    return mission
-            
+                    mission = self.__missionFromTriggerResponse(raw_mission, trigger)
+                    return Mission_Request_Result(
+                        WCS_MISSION_REQUEST_STATUS.CREATED,
+                        mission=mission
+                    )
+
             self.__logger.warn(f"Wrap mission fail: {res.content}")
         except Exception as e:
             self.__logger.error(f"Wrap mission error: {e}")
 
-        return None
+        return Mission_Request_Result(
+            WCS_MISSION_REQUEST_STATUS.FAILED,
+            error="Wrap mission request failed"
+        )
     
-    def __getStoreMission(self, trigger: Mission_Trigger_Model) -> Mission_Model:
+    def __getStoreMission(self, trigger: Mission_Trigger_Model) -> Mission_Request_Result:
         """
         Send provider to auto/manual line trigger.
         Send paller wrapper to warehouse trigger
@@ -441,24 +529,44 @@ class WCS_Interface:
             if res.status_code in HTTP_RESPONSE_CODE.OK:
                 response = res.json()
                 raw_mission = Mission_Trigger_Res.fromDict(response)
+                if raw_mission.code == 2 and raw_mission.mission_code:
+                    self.__logger.warn(f"Store mission exists: {res.content}")
+                    return Mission_Request_Result(
+                        WCS_MISSION_REQUEST_STATUS.EXISTS,
+                        mission_code=raw_mission.mission_code,
+                        current_state=raw_mission.current_state
+                    )
                 if raw_mission.code != 2 and raw_mission.return_location:
-                    mission = Mission_Model()
-                    mission.code = raw_mission.mission_code
-                    mission.location_id = raw_mission.location_id
-                    mission.sector = raw_mission.sectors
-                    mission.rcs_code = raw_mission.mission_rcs
-                    mission.pickup_location = raw_mission.pickup_location
-                    mission.return_location = raw_mission.return_location
-                    mission.gateway_id = trigger.gateway_id
-                    mission.plc_id = trigger.plc_id
-                    mission.button_id = trigger.button_id
-                    return mission
+                    mission = self.__missionFromTriggerResponse(raw_mission, trigger)
+                    return Mission_Request_Result(
+                        WCS_MISSION_REQUEST_STATUS.CREATED,
+                        mission=mission
+                    )
             
             self.__logger.warn(f"Store mission fail: {res.content}")
         except Exception as e:
             self.__logger.error(f"Store mission error: {e}")
 
-        return None
+        return Mission_Request_Result(
+            WCS_MISSION_REQUEST_STATUS.FAILED,
+            error="Store mission request failed"
+        )
+
+    @staticmethod
+    def __missionFromTriggerResponse(raw_mission: Mission_Trigger_Res,
+            trigger: Mission_Trigger_Model) -> Mission_Model:
+        mission = Mission_Model()
+        mission.code = raw_mission.mission_code
+        mission.location_id = raw_mission.location_id
+        mission.sector = raw_mission.sectors
+        mission.rcs_code = raw_mission.mission_rcs
+        mission.pickup_location = raw_mission.pickup_location
+        mission.return_location = raw_mission.return_location
+        mission.gateway_id = trigger.gateway_id
+        mission.plc_id = trigger.plc_id
+        mission.button_id = trigger.button_id
+        mission.current_state = raw_mission.current_state
+        return mission
     
     def cancelMission(self, trigger: Mission_Trigger_Model) -> bool:
         """

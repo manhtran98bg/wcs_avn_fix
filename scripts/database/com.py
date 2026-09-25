@@ -2,6 +2,7 @@ from utils.redis_db import RedisHandler
 from .config import DATABASE_SERVER_CONFIG, DATABASE_NAME
 from .model.mission import Mission_Model
 from .model.mission_trigger import Mission_Trigger_Model
+from .model.mission_pending import Mission_Pending_Model
 from .model.device_connection import Device_Connection_Model
 from .model.curtain import Curtain_Status_Model, CURTAIN_LOCATION, CURTAIN_STATUS
 from .model.pwm import PWM_Status_Model, PWM_Information_Model, PWM_MACHINE_STATUS, PWM_PALLET_STATUS, PWM_WRAP_STATUS
@@ -219,6 +220,10 @@ class Database_Interface(metaclass=Singleton):
             - updateMission: Update mission information
             - removeMissions: Remove missions information
             - getMissionByRcs: RCS get mission information by task code
+        - Mission_Pending_Model:
+            - getMissionPendings: Get durable pending mission requests
+            - updateMissionPending: Add or update a pending request
+            - removeMissionPendings: Remove pending requests
         - Curtain_Status_Model:
             - getCurtainStatus: Get curtain open status
             - updateCurtainStatus: Save curtain open status
@@ -325,6 +330,19 @@ class Database_Interface(metaclass=Singleton):
             if missions[mission].rcs_code == rcs_task_code:
                 return missions[mission]
         return None
+
+    # MISSION PENDING
+    def getMissionPendings(self, *pending_keys: str) -> Dict[str, Mission_Pending_Model]:
+        """Get durable pending mission requests by their physical device key."""
+        return self.__db.lookUp(Mission_Pending_Model, *pending_keys)
+
+    def updateMissionPending(self, pending: Mission_Pending_Model):
+        """Add or update one durable pending mission request."""
+        self.__db.update(pending.key, pending)
+
+    def removeMissionPendings(self, *pending_keys: str):
+        """Remove pending mission requests."""
+        self.__db.delete(Mission_Pending_Model, *pending_keys)
     
     # CURTAIN
     def getCurtainStatus(self, *locations: str) -> Dict[str, Curtain_Status_Model | None]:

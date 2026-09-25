@@ -25,6 +25,7 @@ class Mission_Model(Declare_Class):
     gateway_id: str
     plc_id: str
     button_id: int
+    call_boxes_id: str
 
     code: str
     sector: str
@@ -35,6 +36,7 @@ class Mission_Model(Declare_Class):
 
     rcs_status: str
     agv_code: str
+    current_state: str
 
     type: int
     step: int
